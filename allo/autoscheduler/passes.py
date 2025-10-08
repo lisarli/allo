@@ -82,6 +82,9 @@ def dataflow_optimization_pass(
         mod
     ), "Input kernel is not a perfect affine kernel"
 
+    # create buffers for top-level input args
+    mod = _insert_arg_copy_buffers(mod, top_fn_name)
+
     # Dataflow canonicalization pass
     try:
         mod_dcp = _dataflow_canonicalization_pass(mod)
@@ -261,6 +264,88 @@ def _canonicalize(schedule: Schedule) -> Schedule:
         print(schedule.module)
         raise e
 
+def _insert_arg_copy_buffers(module: Module, top_func_name: str):
+    """
+    For each top-level read-only memref argument of `top_func_name`, create a 
+    local copy buffer, copy over argument values, and replace all uses of with 
+    the new buffer alloc.
+
+    This ensures SPSC safety for input args even after IO wrapping. 
+    """
+
+    with module.context, Location.unknown():
+        top_func = None
+        for op in module.body.operations:
+            if isinstance(op, func_d.FuncOp) and op.name.value == top_func_name:
+                top_func = op
+                break
+        
+        assert top_func is not None, f"Top function {top_func_name} not found"
+
+        ip_first = InsertionPoint(top_func.entry_block.operations[0])
+
+        for idx, arg in enumerate(list(top_func.arguments)):
+            if not isinstance(arg.type, MemRefType):
+                continue
+
+            # check for reads
+            has_load = False
+            has_store = False
+            for use in arg.uses:
+                user = use.owner
+                if isinstance(
+                    user, (memref_d.LoadOp, affine_d.AffineLoadOp)
+                ) or (
+                    isinstance(user, func_d.CallOp) 
+                    and any(oprnd for oprnd in user.operands if oprnd == arg)
+                ):
+                    has_load = True
+                    break
+
+                if isinstance(user, (memref_d.StoreOp, affine_d.AffineStoreOp)):
+                    has_store = True
+                    break
+
+            # skip write-only buffers
+            if not has_load or has_store:
+                continue
+
+            original_owners = [use.owner for use in list(arg.uses)]
+            mem_ty = MemRefType(arg.type)
+            shape = mem_ty.shape
+            if len(shape) == 0:
+                continue
+            
+            # insert local buffer
+            with ip_first:
+                alloc_op = memref_d.AllocOp(mem_ty, [], [], ip=ip_first)
+            alloc_op.attributes["name"] = StringAttr.get(f"arg{idx}_buf")
+
+            loop_ivs = []
+            loops = []
+            loop_ip = InsertionPoint(alloc_op.operation)
+            for dim in shape:
+                loop = affine_d.AffineForOp(lower_bound=0, upper_bound=dim, step=1, ip=loop_ip)
+                loop_ivs.append(loop.induction_variable)
+                loops.append(loop)
+                loop_ip = InsertionPoint(loop.body)
+
+            loops[0].move_after(alloc_op.operation)
+
+            with InsertionPoint(loops[-1].body):
+                idx_map = affine_d.AffineMap.get_identity(len(shape))
+                load_op = affine_d.AffineLoadOp(mem_ty.element_type, arg, loop_ivs, idx_map)
+                affine_d.AffineStoreOp(load_op.result, alloc_op.result, loop_ivs, idx_map)
+
+            for loop in loops:
+                with InsertionPoint(loop.body):
+                    affine_d.AffineYieldOp([])
+
+            # update uses
+            for owner in original_owners:
+                owner.operation.replace_uses_of_with(arg, alloc_op.result)
+
+    return module
 
 def _dataflow_canonicalization_pass(module):
     """
