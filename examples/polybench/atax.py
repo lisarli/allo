@@ -34,10 +34,12 @@ def stage_N[
 
 def kernel_atax[
     T: (float32, int32), M: int32, N: int32
-](A: "T[M, N]", x: "T[N]", y: "T[N]"):
+](A: "T[M, N]", x: "T[N]") -> "T[N]":
     out_Ax: T[M] = 0
+    y: T[N] = 0
     stage_M[T, M, N](A, x, out_Ax)
     stage_N[T, M, N](A, out_Ax, y)
+    return y
 
 
 def atax(concrete_type, m, n):
@@ -72,9 +74,8 @@ def test_atax():
     mod = sch.build()
     A = np.random.rand(M, N).astype(np.float32)
     x = np.random.rand(N).astype(np.float32)
-    y = np.zeros((N,), dtype=np.float32)
     y_ref = atax_np(A, x)
-    mod(A, x, y)
+    y = mod(A, x)
     assert np.allclose(y, y_ref, atol=1e-5, rtol=1e-3)
 
 

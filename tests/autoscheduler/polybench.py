@@ -119,11 +119,10 @@ def gen_atax_inputs(concrete_type, m, n):
 
     A = np.random.randint(-10, 10, (m, n)).astype(np_dtype)
     x = np.random.randint(-10, 10, n).astype(np_dtype)
-    y = np.zeros(n, dtype=np_dtype)
 
     ref_out = atax_np(np.copy(A), np.copy(x))
 
-    return (A, x, y), ref_out
+    return (A, x), ref_out
 
 
 def gen_bicg_inputs(concrete_type, m, n):
