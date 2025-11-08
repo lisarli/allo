@@ -4,8 +4,7 @@ from typing import Any
 from ..customize import Schedule
 from ..ir.utils import MockBuffer
 
-KINDS = ["reorder", "pipeline", "to", "split", "unroll"]
-
+KINDS = ["reorder", "pipeline", "to", "split", "unroll", "partition"]
 
 class SchedulePrimitive:
     def __init__(
@@ -26,6 +25,8 @@ class SchedulePrimitive:
                 return f"BufferToFifo(target={self.args[0]}, dst={self.args[1]})"
             case "split":
                 return f"Split(axis={self.args[0]}, factor={self.args[1]})"
+            case "partition":
+                return f"Partition(target={self.args[0]}, type={self.kwargs['partition_type']}, dim={self.kwargs['dim']}, factor={self.kwargs['factor']})"
 
     def applyTo(self, schedule: Schedule):
         getattr(schedule, self.kind)(*self.args, **self.kwargs)
@@ -51,6 +52,13 @@ class SchedulePrimitive:
     def unroll(axis: str, factor: int):
         """Unroll the axis by the given factor."""
         return SchedulePrimitive("unroll", [axis, factor])
+    
+    @staticmethod
+    def partition(target, partition_type, dim=0, factor=0):
+        """Partition the given array with type/factor/dim."""
+        return SchedulePrimitive("partition", [target], {
+            "partition_type": partition_type, "dim": dim, "factor": factor
+        })
 
 
 class UnresolvedFIFOPrimitive:

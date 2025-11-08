@@ -23,7 +23,7 @@ from .._mlir.dialects import (
     memref as memref_d,
 )
 from .._mlir.passmanager import PassManager as mlir_pass_manager
-from ..customize import Schedule
+from ..customize import Partition, Schedule
 from ..ir.transform import find_func_in_module
 from ..ir.utils import MockBuffer
 from ..verify import verify
@@ -144,7 +144,26 @@ def dataflow_optimization_pass(
 
     # extract FIFO primitives prior to outlining, since this requires IR manipulation
     # dependent on references from the inlined result
+    array_parts = extract_array_partitions(result, dfg, top_fn_name)
     fifos = extract_buffer_to_fifo(result, dfg, schedule, top_fn_name)
+    # Build a set of buffer names that will become FIFOs
+    fifo_bufs = set()
+    for p in fifos:
+        if isinstance(p, UnresolvedFIFOPrimitive):
+            fifo_bufs.add(p.buffer_name)
+        else:
+            # SchedulePrimitive.to: args[0] is MockBuffer(func,name)
+            if p.kind == "to" and isinstance(p.args[0], MockBuffer):
+                fifo_bufs.add(p.args[0].name)
+    # Filter array partitions to avoid streams/FIFOs
+    array_parts = [
+        ap for ap in array_parts
+        if not (isinstance(ap.args[0], MockBuffer) and ap.args[0].name in fifo_bufs)
+    ]
+    print("Number of array partitions after removing duplicate FIFOs:", len(array_parts))
+    for primitive in array_parts:
+        print(f"\t{primitive}")
+
     mod_outlined, node_to_fn = outline_loops_pass(schedule.module, dfg)
     # construct the schedule with the outlined module
     schedule = Schedule(
@@ -155,6 +174,17 @@ def dataflow_optimization_pass(
         schedule.ext_libs,
         schedule.inst_list,
     )
+    # Seed func_args for all outlined functions with the correct arity.
+    for func in schedule.module.body.operations:
+        if isinstance(func, func_d.FuncOp):
+            fname = func.name.value
+            n_args = len(func.arguments)  # number of BlockArguments
+            current = schedule.func_args.get(fname)
+            if current is None:
+                # populate with placeholders "arg0", "arg1", ...
+                schedule.func_args[fname] = [f"arg{i}" for i in range(n_args)]
+            elif len(current) < n_args:
+                schedule.func_args[fname].extend(f"arg{i}" for i in range(len(current), n_args))
 
     if cfg.debug_point == "outline_loops":
         return schedule
@@ -193,6 +223,10 @@ def dataflow_optimization_pass(
     for primitive in post_process:
         primitive.applyTo(schedule)
 
+    for primitive in array_parts:
+        print("applying array paritition primitive,", primitive)
+        primitive.applyTo(schedule)
+
     if cfg.verbose:
         print("Loop opts:")
         for primitive in loop_opts:
@@ -200,6 +234,10 @@ def dataflow_optimization_pass(
         print("Loop tiling:")
         for primitive in loop_tiling:
             print(f"\t{primitive}")
+        if array_parts:
+            print("Array partitions:")
+            for primitive in array_parts:
+                print(f"\t{primitive}")
 
     if cfg.debug_point == "loop_opts":
         return schedule
@@ -815,6 +853,107 @@ def _insert_guard(op: Operation, loops: list[LoopInfo]):
                             op.result, load_op.result
                         )
 
+def extract_array_partitions(
+    analysis_result: DFGAnalysisResult,
+    dfg: DFG,
+    top_func_name: str,
+) -> list[SchedulePrimitive]:
+    tiling = analysis_result.tiling_factors
+    if not tiling:
+        print("[array_partitions] No tiling factors found")
+        return []
+
+    print(f"[array_partitions] Tiling nodes: {list(tiling.keys())}")
+    permutations = dict(analysis_result.loop_permutations)
+    per_buf_dim_factor: dict[tuple[str, int], int] = {}
+
+    for node_id, node in dfg.nodes.items():
+        if node.type != DFGNodeType.AFFINE:
+            continue
+        if node_id not in tiling:
+            continue
+
+        tf = {depth: factor for depth, factor in tiling[node_id] if factor > 1}
+        if not tf:
+            continue
+
+        print(f"[array_partitions] Node {node_id} tiling: {tf}")
+
+        perm_idx = permutations.get(node_id, 0)
+        node_info: NodeInfo = node.node_info[perm_idx]
+
+        for access_map_name, access_map in (
+            ("loads", node_info.loads_map),
+            ("stores", node_info.stores_map),
+        ):
+            for _, acc in access_map.items():
+                opv = acc.op.opview
+                opname = opv.operation.name
+                if opname == "affine.load":
+                    if "from" not in opv.attributes:
+                        continue
+                    buffer_name = opv.attributes["from"].value
+                elif opname == "affine.store":
+                    if "to" not in opv.attributes:
+                        continue
+                    buffer_name = opv.attributes["to"].value
+                else:
+                    continue
+
+                print(f"  [access] Node {node_id} {access_map_name} → {buffer_name}")
+
+                # For each loop depth whose IV appears in the *op indices*, record a partition for that dim.
+                # (This mirrors create_fifo_array’s criterion: IV ∈ op.indices.)
+                indices = list(opv.indices)  # affine.[load|store] indices
+                for depth, loop_info in enumerate(node.loop_info):
+                    iv = loop_info.op.opview.induction_variable
+                    if depth in tf and iv in indices:
+                        dim = depth + 1  # Schedule.partition expects 1-based dim
+                        key = (buffer_name, dim)
+                        per_buf_dim_factor[key] = max(per_buf_dim_factor.get(key, 1), tf[depth])
+                        print(
+                            f"    [match] buffer={buffer_name}, dim={dim}, factor={tf[depth]}"
+                        )
+
+    print(f"[array_partitions] Final partitions: {per_buf_dim_factor}")
+
+    # per_buf_dim_factor: (buffer_name, dim) -> factor   # dim is 1-based
+    # Build per-buffer view and coalesce if possible
+    by_buf: dict[str, dict[int,int]] = {}
+    for (buf, dim), factor in per_buf_dim_factor.items():
+        by_buf.setdefault(buf, {})[dim] = factor
+
+    prims: list[SchedulePrimitive] = []
+    for buf, dim2factor in sorted(by_buf.items()):
+        dims = sorted(dim2factor.keys())
+        factors = {dim2factor[d] for d in dims}
+        if len(dims) >= 2 and len(factors) == 1 and next(iter(factors)) > 1:
+            # Same factor across multiple dims -> one op over all dims
+            factor = next(iter(factors))
+            prims.append(
+                SchedulePrimitive.partition(
+                    target=MockBuffer(top_func_name, buf),
+                    partition_type=Partition.Cyclic,
+                    dim=0,               # all dims
+                    factor=factor,
+                )
+            )
+        else:
+            # Emit per-dim ops (will be at most one in gesummv after FIFO filtering)
+            for dim in dims:
+                factor = dim2factor[dim]
+                if factor > 1:
+                    prims.append(
+                        SchedulePrimitive.partition(
+                            target=MockBuffer(top_func_name, buf),
+                            partition_type=Partition.Cyclic,
+                            dim=dim,
+                            factor=factor,
+                        )
+                    )
+
+    print(f"[array_partitions] Created {len(prims)} partition primitives.")
+    return prims
 
 # Node-parallel specific code
 def extract_tiling(

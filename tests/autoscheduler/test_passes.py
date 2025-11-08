@@ -57,7 +57,7 @@ def test_simple(debug_point, kind):
 
     elif is_available("vitis_hls"):
         mod = optimized_schedule.build(
-            target="vitis_hls", mode=MODE, project="test_simple.prj", wrap_io=True
+            target="vhls", mode=MODE, project="test_simple.prj", wrap_io=True
         )
         input = np.zeros((10, 10), dtype=np.int32)
 
@@ -300,10 +300,10 @@ def test_gemm(debug_point, kind):
 
 
 @pytest.mark.parametrize("debug_point", DEBUG_POINTS)
-@pytest.mark.parametrize("kind", ["graph", "node"])
+@pytest.mark.parametrize("kind", ["graph", "node", "combined"])
 def test_gesummv(debug_point, kind):
     schedule, inputs, expected = get_polybench(
-        "gesummv", size="small", concrete_type=float32
+        "gesummv", size="medium", concrete_type=float32
     )
     try:
         # Create AutoschedulerConfig with the specified parameters
@@ -327,7 +327,7 @@ def test_gesummv(debug_point, kind):
         np.testing.assert_allclose(y, expected, rtol=1e-5, atol=1e-5)
     elif is_available("vitis_hls"):
         mod = optimized_schedule.build(
-            target="vitis_hls", mode=MODE, project="test_gesummv.prj"
+            target="vhls", mode=MODE, project="test_gesummv.prj"
         )
         y = np.zeros_like(expected)
         mod(A, B, x, y)
