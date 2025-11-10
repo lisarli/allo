@@ -3,6 +3,7 @@
 # pylint: disable=no-name-in-module
 import os
 
+
 from .._mlir.ir import (
     Location,
     InsertionPoint,
@@ -16,6 +17,7 @@ from .._mlir.ir import (
     WalkResult,
     Operation,
     MemRefType,
+    BlockArgument
 )
 from .._mlir.dialects import (
     func as func_d,
@@ -144,7 +146,10 @@ def dataflow_optimization_pass(
 
     # extract FIFO primitives prior to outlining, since this requires IR manipulation
     # dependent on references from the inlined result
-    array_parts = extract_array_partitions(result, dfg, top_fn_name)
+    print(f"[debug] Top func args for {top_fn_name}:")
+    for i, a in enumerate(schedule.func_args.get(top_fn_name, [])):
+        print(f"  index={i}, arg={a}, type={type(a)}")
+    array_parts = extract_array_partitions(result, dfg, top_fn_name, schedule)
     fifos = extract_buffer_to_fifo(result, dfg, schedule, top_fn_name)
     # Build a set of buffer names that will become FIFOs
     fifo_bufs = set()
@@ -226,6 +231,8 @@ def dataflow_optimization_pass(
     for primitive in array_parts:
         print("applying array paritition primitive,", primitive)
         primitive.applyTo(schedule)
+    # Ensure callsites match callee memref param layouts after partitioning
+    _fix_call_memref_layout_mismatches(schedule.module)
 
     if cfg.verbose:
         print("Loop opts:")
@@ -815,10 +822,13 @@ def _insert_guard(op: Operation, loops: list[LoopInfo]):
                 )
                 op.move_before(yield_op)
             if isinstance(op, affine_d.AffineLoadOp):
-                fn_op = op.parent
-                while not isinstance(fn_op.opview, func_d.FuncOp):
-                    fn_op = fn_op.parent
-                assert isinstance(fn_op.opview, func_d.FuncOp)
+                # Find the enclosing func via Block -> Region -> owner op
+                blk = op.parent  # this is a Block
+                region = getattr(blk, "parent", None)
+                owner_op = getattr(region, "owner", None)
+                assert owner_op is not None and hasattr(owner_op, "opview"), "Failed to find enclosing function op"
+                assert isinstance(owner_op.opview, func_d.FuncOp), "Enclosing op is not a func.func"
+                fn_op = owner_op  # operation whose opview is func.func
 
                 alloc_op = memref_d.AllocOp(
                     op.memref.type,
@@ -853,11 +863,125 @@ def _insert_guard(op: Operation, loops: list[LoopInfo]):
                             op.result, load_op.result
                         )
 
+def _is_block_argument(val) -> bool:
+    """
+    Robustly detect MLIR block arguments across builds.
+    Works whether or not BlockArgument is a distinct Python class.
+    """
+    # Fast path: MLIR Value typically exposes this flag
+    try:
+        iba = getattr(val, "is_block_argument", None)
+        if iba is True:
+            return True
+    except Exception:
+        pass
+
+    # If the owner is a Block, this is a BlockArgument (OpResult owners are Operations)
+    owner = getattr(val, "owner", None)
+    try:
+        from .._mlir.ir import Block as _Block
+        if isinstance(owner, _Block):
+            return True
+    except Exception:
+        # Fallback: structural check
+        if owner is not None and hasattr(owner, "arguments") and hasattr(owner, "operations"):
+            # Typical Block shape in Python bindings
+            if hasattr(val, "arg_number"):
+                return True
+
+    return False
+
+
+def _map_blockarg_to_top_name_and_func(module, schedule, top_func_name, callee_func_name, callee_arg_index):
+    """
+    Given a callee function and one of its BlockArguments (by index),
+    find the callsite in the top function and return the *top-level* buffer identity:
+      -> (top_func_name, top_arg_name_or_index_str)
+    If the actual operand is a memref.cast chain, peel it.
+    Returns (func_name, buf_name) or (None, None) if unresolved.
+    """
+    # find top function op
+    topf = None
+    for f in module.body.operations:
+        if isinstance(f, func_d.FuncOp) and f.name.value == top_func_name:
+            topf = f
+            break
+    if topf is None:
+        return (None, None)
+
+    # find the callee func op
+    callee = None
+    for f in module.body.operations:
+        if isinstance(f, func_d.FuncOp) and f.name.value == callee_func_name:
+            callee = f
+            break
+    if callee is None:
+        return (None, None)
+
+    # look for callsites in the top function
+    for op in topf.body.blocks[0].operations:
+        if not isinstance(op, func_d.CallOp):
+            continue
+        if op.attributes.get("callee", None) is None:
+            continue
+        if op.attributes["callee"].value != callee_func_name:
+            continue
+        if callee_arg_index >= len(op.operands):
+            continue
+        actual = op.operands[callee_arg_index]
+
+        # peel memref.cast/subview/reinterpret_cast to a stable root
+        root = actual
+        seen = set()
+        while hasattr(root, "owner") and root.owner not in seen:
+            seen.add(root.owner)
+            o = root.owner
+            nm = getattr(o, "name", getattr(o.operation, "name", ""))
+            if nm in ("memref.cast", "memref.reinterpret_cast", "memref.subview"):
+                root = o.operands[0]
+                continue
+            break
+
+        # top-level BlockArgument?
+        if _is_block_argument(root):
+            top_idx = root.arg_number
+            fa = schedule.func_args.get(top_func_name, [])
+            if top_idx < len(fa):
+                friendly = getattr(fa[top_idx], "name", fa[top_idx]) or str(top_idx)
+            else:
+                friendly = str(top_idx)
+            return (top_func_name, friendly)
+
+        # alloc/global with name?
+        if hasattr(root, "owner") and hasattr(root.owner, "attributes") and "name" in root.owner.attributes:
+            return (top_func_name, root.owner.attributes["name"].value)
+
+    return (None, None)
+
+
 def extract_array_partitions(
     analysis_result: DFGAnalysisResult,
     dfg: DFG,
     top_func_name: str,
+    schedule: Schedule,
 ) -> list[SchedulePrimitive]:
+    def _resolve_source_memref(val):
+        """Follow memref.cast/subview/etc. back to a stable identity."""
+        if _is_block_argument(val):
+            return val
+        op = getattr(val, "owner", None)
+        while op is not None and not isinstance(op, Block):
+            op_name = op.operation.name if hasattr(op, "operation") else getattr(op, "name", "")
+            if op_name in ("memref.cast", "memref.reinterpret_cast", "memref.subview"):
+                src = op.operands[0]
+                if _is_block_argument(src):
+                    return src
+                val = src
+                op = getattr(val, "owner", None)
+                continue
+            break
+        return val
+
     tiling = analysis_result.tiling_factors
     if not tiling:
         print("[array_partitions] No tiling factors found")
@@ -866,6 +990,7 @@ def extract_array_partitions(
     print(f"[array_partitions] Tiling nodes: {list(tiling.keys())}")
     permutations = dict(analysis_result.loop_permutations)
     per_buf_dim_factor: dict[tuple[str, int], int] = {}
+    owner_for_buf: dict[str, str] = {}
 
     for node_id, node in dfg.nodes.items():
         if node.type != DFGNodeType.AFFINE:
@@ -882,44 +1007,127 @@ def extract_array_partitions(
         perm_idx = permutations.get(node_id, 0)
         node_info: NodeInfo = node.node_info[perm_idx]
 
-        for access_map_name, access_map in (
-            ("loads", node_info.loads_map),
-            ("stores", node_info.stores_map),
-        ):
-            for _, acc in access_map.items():
+        for access_map in (node_info.loads_map, node_info.stores_map):
+            for access_map_name, acc in access_map.items():
                 opv = acc.op.opview
-                opname = opv.operation.name
-                if opname == "affine.load":
-                    if "from" not in opv.attributes:
-                        continue
-                    buffer_name = opv.attributes["from"].value
-                elif opname == "affine.store":
-                    if "to" not in opv.attributes:
-                        continue
-                    buffer_name = opv.attributes["to"].value
+                if isinstance(opv, affine_d.AffineLoadOp):
+                    memref_val = opv.memref
+                elif isinstance(opv, affine_d.AffineStoreOp):
+                    memref_val = opv.memref
                 else:
                     continue
 
+                root = _resolve_source_memref(memref_val)
+                print(f"  [debug] Node {node_id} {access_map_name}: root={root}")
+
+                buffer_name = None
+                buffer_func = None
+                arg_index = None
+
+                # =========== BLOCK ARGUMENT (function parameter) ===========
+                if _is_block_argument(root):
+                    parent_block = root.owner  # Block
+                    parent_region = getattr(parent_block, "parent", None)  # Region
+                    parent_owner_op = getattr(parent_region, "owner", None)  # Operation
+                    if parent_owner_op is not None and hasattr(parent_owner_op, "opview") and isinstance(parent_owner_op.opview, func_d.FuncOp):
+                        callee_func_name = parent_owner_op.opview.name.value
+                    else:
+                        callee_func_name = top_func_name
+                    try:
+                        arg_index = getattr(root, "arg_number", None)
+                        if arg_index is None and hasattr(root, "owner") and hasattr(root.owner, "arguments"):
+                            # fallback: manually locate argument index in the block
+                            block_args = list(root.owner.arguments)
+                            arg_index = block_args.index(root)
+                    except Exception:
+                        arg_index = None
+                    print(f"  [debug] root is BlockArgument #{arg_index} of func {callee_func_name}")
+
+                    # top-level argument (A, B, x, y) handling
+                    if callee_func_name == top_func_name:
+                        fa = schedule.func_args.get(top_func_name, [])
+                        print(f"  [debug] top-level func args for {top_func_name}: {fa}")
+                        if arg_index < len(fa):
+                            buffer_func = top_func_name
+                            arg_obj = fa[arg_index]
+                            # ✅ Handle DTensor or plain string
+                            if hasattr(arg_obj, "name"):
+                                buffer_name = arg_obj.name
+                            else:
+                                buffer_name = str(arg_obj)
+                            print(f"  [debug] matched top-level arg {buffer_name} for index {arg_index}")
+                        else:
+                            buffer_func = top_func_name
+                            buffer_name = f"arg{arg_index}"
+                            print(f"  [debug] fallback arg name arg{arg_index}")
+                    else:
+                        # nested call argument mapping
+                        print(f"  [debug] mapping callee {callee_func_name} arg {arg_index} to top...")
+                        mapped_func, mapped_name = _map_blockarg_to_top_name_and_func(
+                            schedule.module, schedule, top_func_name, callee_func_name, arg_index
+                        )
+                        if mapped_func and mapped_name:
+                            buffer_func = mapped_func
+                            buffer_name = mapped_name
+                            print(f"  [debug] resolved via map → {mapped_func}:{mapped_name}")
+                        else:
+                            # fallback local naming
+                            buffer_func = callee_func_name
+                            fa = schedule.func_args.get(buffer_func, [])
+                            if arg_index < len(fa):
+                                buffer_name = getattr(fa[arg_index], "name", fa[arg_index]) or str(arg_index)
+                            else:
+                                buffer_name = str(arg_index)
+                            print(f"  [debug] fallback local param name {buffer_name} for {callee_func_name}")
+                # =========== LOCAL ALLOC OR GLOBAL ===========
+                else:
+                    if hasattr(root, "owner") and hasattr(root.owner, "attributes") and "name" in root.owner.attributes:
+                        cur = root.owner
+                        owner_func = None
+                        while cur is not None:
+                            po = getattr(cur, "parent", None)
+                            if po is None:
+                                break
+                            if hasattr(po, "opview") and isinstance(po.opview, func_d.FuncOp):
+                                owner_func = po.opview.name.value
+                                break
+                            cur = po
+                        buffer_func = owner_func or top_func_name
+                        buffer_name = root.owner.attributes["name"].value
+                        print(f"  [debug] local alloc {buffer_name} under {buffer_func}")
+                    else:
+                        print(f"  [debug] could not identify alloc root {root}")
+
+                # Record owner only if both valid
+                if buffer_name and buffer_func:
+                    owner_for_buf.setdefault(buffer_name, buffer_func)
+                else:
+                    print(f"  [skip] missing owner or name: func={buffer_func}, name={buffer_name}")
+
+                if not buffer_name or buffer_func is None:
+                    print(f"  [skip] could not derive name for {root}")
+                    continue
+
+                # extra top-level debug
+                print(f"  [debug] derived buffer_func={buffer_func}, buffer_name={buffer_name}")
+
                 print(f"  [access] Node {node_id} {access_map_name} → {buffer_name}")
 
-                # For each loop depth whose IV appears in the *op indices*, record a partition for that dim.
-                # (This mirrors create_fifo_array’s criterion: IV ∈ op.indices.)
-                indices = list(opv.indices)  # affine.[load|store] indices
+                # Record per-dimension partition factors
+                indices = list(opv.indices)
                 for depth, loop_info in enumerate(node.loop_info):
                     iv = loop_info.op.opview.induction_variable
                     if depth in tf and iv in indices:
-                        dim = depth + 1  # Schedule.partition expects 1-based dim
+                        dim = depth + 1
                         key = (buffer_name, dim)
                         per_buf_dim_factor[key] = max(per_buf_dim_factor.get(key, 1), tf[depth])
-                        print(
-                            f"    [match] buffer={buffer_name}, dim={dim}, factor={tf[depth]}"
-                        )
+                        print(f"    [match] buffer={buffer_name}, dim={dim}, factor={tf[depth]}")
 
     print(f"[array_partitions] Final partitions: {per_buf_dim_factor}")
+    print(f"[array_partitions] owner_for_buf mapping: {owner_for_buf}")
 
-    # per_buf_dim_factor: (buffer_name, dim) -> factor   # dim is 1-based
-    # Build per-buffer view and coalesce if possible
-    by_buf: dict[str, dict[int,int]] = {}
+    # Group by buffer
+    by_buf: dict[str, dict[int, int]] = {}
     for (buf, dim), factor in per_buf_dim_factor.items():
         by_buf.setdefault(buf, {})[dim] = factor
 
@@ -927,25 +1135,24 @@ def extract_array_partitions(
     for buf, dim2factor in sorted(by_buf.items()):
         dims = sorted(dim2factor.keys())
         factors = {dim2factor[d] for d in dims}
+        print(f"  [debug] buffer {buf}: dims={dims}, factors={factors}, owner={owner_for_buf.get(buf)}")
         if len(dims) >= 2 and len(factors) == 1 and next(iter(factors)) > 1:
-            # Same factor across multiple dims -> one op over all dims
             factor = next(iter(factors))
             prims.append(
                 SchedulePrimitive.partition(
-                    target=MockBuffer(top_func_name, buf),
+                    target=MockBuffer(owner_for_buf.get(buf, top_func_name), buf),
                     partition_type=Partition.Cyclic,
-                    dim=0,               # all dims
+                    dim=0,
                     factor=factor,
                 )
             )
         else:
-            # Emit per-dim ops (will be at most one in gesummv after FIFO filtering)
             for dim in dims:
                 factor = dim2factor[dim]
                 if factor > 1:
                     prims.append(
                         SchedulePrimitive.partition(
-                            target=MockBuffer(top_func_name, buf),
+                            target=MockBuffer(owner_for_buf.get(buf, top_func_name), buf),
                             partition_type=Partition.Cyclic,
                             dim=dim,
                             factor=factor,
@@ -1084,6 +1291,49 @@ def create_fifo_array(
     return new_alloc, len(fifo_dims) + len(
         extra_dims
     )  # return the number of dimensions in the new FIFO array
+
+
+def _fix_call_memref_layout_mismatches(module: Module):
+    """
+    After array partitioning (which changes affine maps/layouts on caller-side memrefs),
+    insert memref.cast at callsites so the argument type matches the callee param type.
+    Only fixes *layout* differences (shape/elemtype/memspace must match).
+    """
+    with module.context, Location.unknown():
+        for f in module.body.operations:
+            if not isinstance(f, func_d.FuncOp):
+                continue
+            # Walk call ops in this function
+            for op in list(f.entry_block.operations):
+                if not isinstance(op, func_d.CallOp):
+                    continue
+                callee_sym = op.attributes.get("callee", None)
+                if callee_sym is None:
+                    continue
+                callee_name = callee_sym.value
+                callee = None
+                for g in module.body.operations:
+                    if isinstance(g, func_d.FuncOp) and g.name.value == callee_name:
+                        callee = g
+                        break
+                if callee is None:
+                    continue
+                changed = False
+                new_ops = list(op.operands)
+                for i, (actual, formal) in enumerate(zip(op.operands, callee.arguments)):
+                    src_ty = getattr(actual, "type", None)
+                    dst_ty = getattr(formal, "type", None)
+                    if isinstance(src_ty, MemRefType) and isinstance(dst_ty, MemRefType):
+                        same_shape = tuple(src_ty.shape) == tuple(dst_ty.shape)
+                        same_elem  = src_ty.element_type == dst_ty.element_type
+                        same_space = src_ty.memory_space == dst_ty.memory_space
+                        if same_shape and same_elem and same_space and src_ty != dst_ty:
+                            with InsertionPoint(op):
+                                cast = memref_d.CastOp(dst_ty, actual)
+                            new_ops[i] = cast.result
+                            changed = True
+                if changed:
+                    op.operands[:] = new_ops
 
 
 def _tiling_post_process(schedule: Schedule):
