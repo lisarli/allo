@@ -1126,6 +1126,32 @@ def extract_array_partitions(
     print(f"[array_partitions] Final partitions: {per_buf_dim_factor}")
     print(f"[array_partitions] owner_for_buf mapping: {owner_for_buf}")
 
+    # --- Infer ranks from schedule.func_args to avoid flattening 2D buffers ---
+    inferred_ranks: dict[str, int] = {}
+    top_args = schedule.func_args.get(top_func_name, [])
+    for arg in top_args:
+        name = getattr(arg, "name", None)
+        if name is not None and hasattr(arg, "shape"):
+            inferred_ranks[name] = len(arg.shape)
+    print(f"  [rank-infer] inferred ranks: {inferred_ranks}")
+
+    # --- Normalize only when necessary ---
+    # Fixes invalid dims for 1D buffers (like x, y) but preserves multi-dim buffers (like A, B)
+    normalized: dict[tuple[str, int], int] = {}
+    for (buf, dim), factor in per_buf_dim_factor.items():
+        rank = inferred_ranks.get(buf, 1)
+        if dim > rank:
+            valid_dim = rank
+            print(f"  [normalize] adjusted dim for {buf}: {dim} → {valid_dim} (rank={rank})")
+        else:
+            valid_dim = dim
+
+        key = (buf, valid_dim)
+        normalized[key] = max(normalized.get(key, 1), factor)
+
+    per_buf_dim_factor = normalized
+    # --- End normalization ---
+
     # Group by buffer
     by_buf: dict[str, dict[int, int]] = {}
     for (buf, dim), factor in per_buf_dim_factor.items():
