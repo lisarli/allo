@@ -40,6 +40,8 @@ from .util import (
 from .dfg import DFG, DFGNodeType, NodeInfo, DFGAnalysisResult, LoopInfo
 from .primitives import SchedulePrimitive, UnresolvedFIFOPrimitive
 from .config import AutoschedulerConfig
+from collections import defaultdict
+
 
 DEBUG_POINTS = [
     "mlir_preprocess",
@@ -822,12 +824,20 @@ def _insert_guard(op: Operation, loops: list[LoopInfo]):
                 )
                 op.move_before(yield_op)
             if isinstance(op, affine_d.AffineLoadOp):
-                # Find the enclosing func via Block -> Region -> owner op
-                blk = op.parent  # this is a Block
-                region = getattr(blk, "parent", None)
-                owner_op = getattr(region, "owner", None)
-                assert owner_op is not None and hasattr(owner_op, "opview"), "Failed to find enclosing function op"
-                assert isinstance(owner_op.opview, func_d.FuncOp), "Enclosing op is not a func.func"
+                # Walk up parent chain to find enclosing func.func
+                cur = op.operation if hasattr(op, "operation") else op
+                owner_op = None
+                while cur is not None:
+                    # should be op with opview is func_d.FuncOp
+                    if hasattr(cur, "opview") and isinstance(cur.opview, func_d.FuncOp):
+                        owner_op = cur
+                        break
+                    cur = getattr(cur, "parent", None)
+
+                assert owner_op is not None and hasattr(owner_op, "opview"), \
+                    "Failed to find enclosing function op"
+                assert isinstance(owner_op.opview, func_d.FuncOp), \
+                    "Enclosing op is not a func.func"
                 fn_op = owner_op  # operation whose opview is func.func
 
                 alloc_op = memref_d.AllocOp(
@@ -1117,40 +1127,66 @@ def extract_array_partitions(
                 indices = list(opv.indices)
                 for depth, loop_info in enumerate(node.loop_info):
                     iv = loop_info.op.opview.induction_variable
-                    if depth in tf and iv in indices:
-                        dim = depth + 1
-                        key = (buffer_name, dim)
-                        per_buf_dim_factor[key] = max(per_buf_dim_factor.get(key, 1), tf[depth])
-                        print(f"    [match] buffer={buffer_name}, dim={dim}, factor={tf[depth]}")
+                    if depth not in tf:
+                        continue
 
-    print(f"[array_partitions] Final partitions: {per_buf_dim_factor}")
-    print(f"[array_partitions] owner_for_buf mapping: {owner_for_buf}")
+                    # Map loop IV to memref dimension index
+                    for idx_pos, idx_val in enumerate(indices):
+                        if idx_val == iv:
+                            dim = idx_pos + 1
+                            key = (buffer_name, dim)
+                            old = per_buf_dim_factor.get(key, 1)
+                            per_buf_dim_factor[key] = max(old, tf[depth])
+                            print(f"    [match] buffer={buffer_name}, dim={dim}, factor={tf[depth]}")
+                            break
 
-    # --- Infer ranks from schedule.func_args to avoid flattening 2D buffers ---
-    inferred_ranks: dict[str, int] = {}
-    top_args = schedule.func_args.get(top_func_name, [])
-    for arg in top_args:
-        name = getattr(arg, "name", None)
-        if name is not None and hasattr(arg, "shape"):
-            inferred_ranks[name] = len(arg.shape)
-    print(f"  [rank-infer] inferred ranks: {inferred_ranks}")
 
-    # --- Normalize only when necessary ---
-    # Fixes invalid dims for 1D buffers (like x, y) but preserves multi-dim buffers (like A, B)
-    normalized: dict[tuple[str, int], int] = {}
-    for (buf, dim), factor in per_buf_dim_factor.items():
-        rank = inferred_ranks.get(buf, 1)
-        if dim > rank:
-            valid_dim = rank
-            print(f"  [normalize] adjusted dim for {buf}: {dim} → {valid_dim} (rank={rank})")
-        else:
-            valid_dim = dim
+        print(f"[array_partitions] Final partitions: {per_buf_dim_factor}")
+        print(f"[array_partitions] owner_for_buf mapping: {owner_for_buf}")
 
-        key = (buf, valid_dim)
-        normalized[key] = max(normalized.get(key, 1), factor)
+        # Infer ranks and normalize
+        inferred_ranks: dict[str, int] = {}
+        top_args = schedule.func_args.get(top_func_name, [])
+        for arg in top_args:
+            name = getattr(arg, "name", None)
+            if name is not None and hasattr(arg, "shape"):
+                inferred_ranks[name] = len(arg.shape)
 
-    per_buf_dim_factor = normalized
-    # --- End normalization ---
+        buf_dims: dict[str, set[int]] = defaultdict(set)
+        for (buf, dim), factor in per_buf_dim_factor.items():
+            if dim != 0:
+                buf_dims[buf].add(dim)
+
+        for buf, dims in buf_dims.items():
+            if buf not in inferred_ranks and dims:
+                inferred_ranks[buf] = max(dims)
+
+        print(f"  [rank-infer] inferred ranks: {inferred_ranks}")
+
+        normalized: dict[tuple[str, int], int] = {}
+        for (buf, dim), factor in per_buf_dim_factor.items():
+            if dim == 0:
+                # all dimensions
+                key = (buf, dim)
+                prev = normalized.get(key, 0)
+                normalized[key] = max(prev, factor)
+                continue
+
+            rank = inferred_ranks.get(buf)
+            if rank is None:
+                # fallback
+                rank = dim
+
+            if dim > rank:
+                raise RuntimeError(
+                    f"[array_partitions] Partition dim {dim} > rank {rank} for buffer {buf}"
+                )
+
+            key = (buf, dim)
+            prev = normalized.get(key, 0)
+            normalized[key] = max(prev, factor)
+
+        per_buf_dim_factor = normalized
 
     # Group by buffer
     by_buf: dict[str, dict[int, int]] = {}

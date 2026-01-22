@@ -309,19 +309,22 @@ class Schedule:
                 raise AlloValueError("Not supported partition type")
         if isinstance(target, str):
             target = MockBuffer(target.split(":")[0], target.split(":")[1])
-        # test whether partitioning the same array
-        for parray, items in self.partitioned_arrays.items():
-            for item in items:
-                if (
-                    parray.split(":")[0] == target.func
-                    and parray.split(":")[1] == target.name
-                ):
-                    if item[0] == Partition.Complete and item[1] == 0:
-                        # this array has been completely partitioned along all the axes
-                        return
-                    raise AlloValueError(
-                        f"Cannot partition the same array twice: {parray}, {item} vs ({partition_type}, {dim}, {factor})"
-                    )
+            # check whether partitioning the same array
+            for parray, items in self.partitioned_arrays.items():
+                func_name, buf_name = parray.split(":")
+                if func_name == target.func and buf_name == target.name:
+                    for old_type, old_dim, old_factor in items:
+                        # skip if already partitioned on all dimensions
+                        if old_type == Partition.Complete and old_dim == 0:
+                            return
+
+                        # disallow conflicting partitions
+                        if old_dim == 0 or dim == 0 or old_dim == dim:
+                            raise AlloValueError(
+                                f"Cannot partition the same array twice on dim={old_dim} and dim={dim}: "
+                                f"{parray}, ({old_type}, {old_dim}, {old_factor}) vs "
+                                f"({partition_type}, {dim}, {factor})"
+                            )
         # actual partition
         i32 = IntegerType.get_signless(32)
         ui32 = IntegerType.get_unsigned(32)
